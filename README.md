@@ -31,3 +31,22 @@ Get sheet music from youtube videos
 
 3. Check 'Sheet Music' folder in the directory for the resulting PDF
 ![resulting pdf](https://github.com/Wubaboo/ytSheetMusic/blob/main/img/res.png?raw=true)
+
+---
+
+## Local mode (no AWS)
+
+A complete local pipeline that skips the S3/web-app layer and produces a
+quality-tuned PDF: lossless grayscale (no dither dots, no gray haze, no
+eroded or stair-stepped strokes), duplicate-free stacking for scrolling
+scores, an optional title/artist header, and a capture-verification tool.
+See [local/README.md](local/README.md) for details.
+
+```bash
+bash local/setup.sh                       # .venv + deps (needs ffmpeg)
+.venv/bin/python local/run_pipeline.py \
+    --url 'https://www.youtube.com/watch?v=XXXXXXXX' \
+    --name 'Artist_Song' --title '曲名' --artist '藝術家' [--hands]
+.venv/bin/python local/verify_capture.py \
+    --video output/<name>.mp4 --frames output/<name>
+```

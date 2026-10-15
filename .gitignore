@@ -5,3 +5,9 @@
 *.webm
 *.exe
 *.sh
+__pycache__/
+
+# local mode
+.venv/
+output/
+!local/setup.sh
