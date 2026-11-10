@@ -8,7 +8,8 @@ verification. Run with the venv python created by local/setup.sh.
 Usage:
   .venv/bin/python local/run_pipeline.py --url <YT_URL> --name <output_name> \
       [--repo PATH] [--outdir output] [--title T] [--artist A] \
-      [--hands] [--ssim 0.9] [--interval 100] [--keep-video] \
+      [--hands] [--strip Y0:Y1] [--fps 4] [--change 0.90] \
+      [--ssim 0.9] [--interval 100] [--keep-video] \
       [--thr 195] [--sigma 0.6] [--gamma 1.25] [--white 235]
 
 By default the repo modules (screenshot.py etc.) are taken from this fork
@@ -28,6 +29,13 @@ Implementation notes (details and rationale in local/README.md):
   * writes a lossless grayscale PDF (img2pdf/Flate), letter 8.5x11 @ 300dpi,
     with optional title/artist header (CJK font auto-detect + download
     fallback) and PDF metadata.
+  * --strip Y0:Y1 replaces both capture stages for videos that keep the score
+    in a CONSTANT band under live footage (drum-cam on top, notation strip at
+    the bottom). The contour crop of --hands cannot lock onto such a band -
+    the moving footage above it drags the crop around, which stacks duplicate
+    systems and leaves black smears of footage in the page - so the rectangle
+    is given explicitly and the display states are found by frame-to-frame
+    similarity. More on why in local/README.md.
 """
 
 import argparse
@@ -160,6 +168,91 @@ def best_shift(A, B):
             if d > best[2]:
                 best = (s, dy, d)
     return best
+
+
+# --------------------------------------------------------- fixed strip mode ---
+
+STRIP_SIG_W = 480                    # width used for state-change detection
+
+
+def strip_gray(path):
+    """Load a cropped strip: colored overlays (highlight bars, cursors) -> white."""
+    im = Image.open(path).convert('RGB')
+    rgb = np.array(im).astype(np.int16)
+    gray = np.array(im.convert('L'))
+    gray[(rgb.max(axis=2) - rgb.min(axis=2)) > 25] = 255
+    return gray
+
+
+def strip_sig(gray):
+    """Coarse signature with staff lines removed (they dominate the ink)."""
+    w = STRIP_SIG_W
+    b = (cv2.resize(gray, (w, max(1, int(gray.shape[0] * w / gray.shape[1]))),
+                    interpolation=cv2.INTER_AREA) < 160).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    lines = cv2.dilate(cv2.morphologyEx(b, cv2.MORPH_OPEN, k), k)
+    return (b & (1 - lines)).astype(bool)
+
+
+def strip_sim(A, B, max_shift=2):
+    """Best dice over small dx/dy shifts (render jitter, resampling)."""
+    best = 0.0
+    for dy in range(-max_shift, max_shift + 1):
+        for dx in (-1, 0, 1):
+            a = A[max(0, dy):A.shape[0] + min(0, dy), max(0, dx):A.shape[1] + min(0, dx)]
+            b = B[max(0, -dy):B.shape[0] - max(0, dy), max(0, -dx):B.shape[1] - max(0, dx)]
+            h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+            a, b = a[:h, :w], b[:h, :w]
+            den = a.sum() + b.sum()
+            if den:
+                best = max(best, 2.0 * np.logical_and(a, b).sum() / den)
+    return best
+
+
+def capture_strip(video, framedir, crop, fps, change):
+    """Fixed-band capture: one clean image per displayed state.
+
+    Consecutive samples are compared to find cuts (the video holds each system
+    for seconds); every state keeps the pixel-wise MEDIAN of its frames, which
+    kills JPEG noise and one-frame overlay blips. Title/end cards are dropped
+    because they are mostly dark. Writes frame_%03d.png into framedir (so the
+    normal drop/dedupe/assembly stages run unchanged) and returns the display
+    time of every written frame."""
+    os.makedirs(framedir, exist_ok=True)
+    for f in glob.glob(os.path.join(framedir, '*')):
+        os.remove(f)
+    subprocess.run(['ffmpeg', '-loglevel', 'error', '-i', video, '-vf',
+                    f'fps={fps},crop={crop}', '-q:v', '1',
+                    os.path.join(framedir, 's%05d.jpg')], check=True)
+
+    files = sorted(glob.glob(os.path.join(framedir, 's*.jpg')))
+    if not files:
+        sys.exit('ERROR: strip capture produced no frames - check --strip Y0:Y1.')
+    print(f'    sampled {len(files)} frames at {fps}fps')
+
+    sigs = [strip_sig(strip_gray(f)) for f in files]
+    cuts = [i for i in range(1, len(sigs)) if strip_sim(sigs[i - 1], sigs[i]) < change]
+    bounds = [0] + cuts + [len(files)]
+    segs = [(bounds[i], bounds[i + 1] - 1) for i in range(len(bounds) - 1)]
+    print(f'    {len(segs)} display states')
+
+    times = []
+    for a, b in segs:
+        lo = a + (b - a) // 4                 # median of the middle half
+        hi = max(lo + 1, b - (b - a) // 4 + 1)
+        med = np.median(np.stack([strip_gray(files[i]) for i in range(lo, hi)]),
+                        axis=0).astype(np.uint8)
+        white, ink = (med > 235).mean(), (med < 160).mean()
+        if white < 0.60 or ink < 0.005:
+            print(f'    dropping state at {a / fps:6.1f}s: '
+                  f'white={white:.2f} ink={ink:.3f}')
+            continue
+        Image.fromarray(med, 'L').convert('RGB').save(
+            os.path.join(framedir, f'frame_{len(times):03d}.png'))
+        times.append(a / fps)
+    for f in files:                           # keep only the chosen states
+        os.remove(f)
+    return times
 
 
 # ------------------------------------------------------------- build stage ---
@@ -345,6 +438,15 @@ def main():
     ap.add_argument('--artist', default=None, help='artist for the page-1 header')
     ap.add_argument('--hands', action='store_true',
                     help='sheet is embedded in video footage - crop to it')
+    ap.add_argument('--strip', default=None, metavar='Y0:Y1',
+                    help='score sits in a CONSTANT band (source pixels, full '
+                         'width), e.g. 858:1080 - replaces --hands and is far '
+                         'more reliable when footage moves above the strip')
+    ap.add_argument('--fps', type=float, default=4.0,
+                    help='strip capture sampling rate (only with --strip)')
+    ap.add_argument('--change', type=float, default=0.90,
+                    help='strip similarity below this starts a new display '
+                         'state (only with --strip)')
     ap.add_argument('--ssim', type=float, default=0.95,
                     help='screenshot dedup threshold; higher keeps more frames')
     ap.add_argument('--interval', type=int, default=100,
@@ -397,19 +499,34 @@ def main():
         print('==> wiping stale frames in', frame_dir)
         for f in glob.glob(os.path.join(frame_dir, '*')):
             os.remove(f)
-    print(f'==> capture (hands={args.hands}, ssim={args.ssim}, interval={args.interval})')
-    os.chdir(outdir)
-    s = Screenie(os.path.basename(video), fname=base, hands=args.hands,
-                 threshold=args.ssim)
-    with open(os.path.join(outdir, 'capture.log'), 'w') as log, \
-            contextlib.redirect_stdout(log):
-        s.take_screenies(interval=args.interval)
-    os.chdir(work)
+    if args.strip:
+        if args.hands:
+            print('NOTE: --strip replaces --hands; ignoring --hands')
+        y0, y1 = (int(v) for v in args.strip.split(':'))
+        if not 0 <= y0 < y1:
+            sys.exit(f'ERROR: --strip expects Y0:Y1 with 0 <= Y0 < Y1, got {args.strip}')
+        print(f'==> strip capture (y {y0}..{y1}, fps={args.fps}, change={args.change})')
+        times = capture_strip(video, frame_dir, f'iw:{y1 - y0}:0:{y0}',
+                              args.fps, args.change)
+        if not times:
+            sys.exit('ERROR: strip capture found no score states - check --strip.')
+        print(f'==> {len(times)} kept states at '
+              + ', '.join(f'{t:.1f}s' for t in times))
+    else:
+        print(f'==> capture (hands={args.hands}, ssim={args.ssim}, interval={args.interval})')
+        os.chdir(outdir)
+        s = Screenie(os.path.basename(video), fname=base, hands=args.hands,
+                     threshold=args.ssim)
+        with open(os.path.join(outdir, 'capture.log'), 'w') as log, \
+                contextlib.redirect_stdout(log):
+            s.take_screenies(interval=args.interval)
+        os.chdir(work)
 
-    files = sorted(glob.glob(os.path.join(frame_dir, 'frame_*.jpg')))
+    files = sorted(glob.glob(os.path.join(frame_dir, 'frame_*')))
     if not files:
         sys.exit('ERROR: no frames captured - sheet music may not be detectable. '
-                 'Try --hands / --ssim 0.95 / a different --interval.')
+                 'Try --strip Y0:Y1 (fixed band) / --hands / --ssim 0.95 / a '
+                 'different --interval.')
 
     # drop non-sheet captures: sponsor/title/logo cards have no staff lines
     # or are mostly dark; contour-cropped title-card glyphs ("O") are tiny.

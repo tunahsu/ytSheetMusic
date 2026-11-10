@@ -15,6 +15,8 @@ bash local/setup.sh              # creates .venv + installs deps
     --name 'Artist_Song' \
     --title '曲名' --artist '藝術家' \
     [--hands]                    # sheet embedded in footage -> contour-crop it
+    # or, when the score sits in a constant band under moving footage:
+    #   --strip 858:1080         # band top:bottom at the source resolution
 
 # optional: prove the capture is complete before trusting the PDF
 .venv/bin/python local/verify_capture.py \
@@ -48,6 +50,17 @@ Output: `output/<name>.pdf` (letter 8.5x11in @ 300dpi, lossless grayscale).
   downloaded) and `/Title` + `/Author` set in the PDF.
 - **Non-sheet screens are dropped**: title cards, sponsor cards and end
   cards are filtered by capture geometry and brightness before assembly.
+- **Fixed strip mode (`--strip`)**: many drum-cover videos keep the score in
+  a band that never moves while the footage above it animates. The contour
+  crop behind `--hands` cannot lock onto that band - the moving footage drags
+  the crop around, so the same system gets captured several times (each copy
+  with a different smear of footage below it) and the page ends up with
+  duplicated bars over black bands. With `--strip Y0:Y1` the rectangle is
+  given explicitly, consecutive samples are compared to find the real cuts,
+  and each displayed state is the pixel-wise **median** of its frames, which
+  removes JPEG noise and one-frame blips (a brief overlay, a fade frame).
+  Measured on a 4:10 drum cover: 31 states x 4 bars x 2s = 246.5s, exactly
+  the notation timeline, with no duplicated or missing systems.
 - **Capture verification**: `verify_capture.py` checks that every captured
   frame corresponds to a settled display state of the video using a
   native-scale template match (dice >= 0.90; true matches score 0.97+), and
@@ -57,6 +70,15 @@ Output: `output/<name>.pdf` (letter 8.5x11in @ 300dpi, lossless grayscale).
 
 - `--hands`: the sheet is embedded in video footage (e.g. drum cam on top,
   notation strip at the bottom).
+- `--strip Y0:Y1`: same situation but the score band never moves (it is
+  pasted at a fixed place in the frame). Prefer this over `--hands` - it is
+  deterministic and does not depend on contour detection. Find the band once
+  in a frame, e.g. `ffmpeg -ss 30 -i out.mp4 -frames:v 1 f.png` and look at
+  the pixel rows, or measure it: the first mostly-white row from the bottom
+  is the top of the strip. `--fps 4` is dense enough for 4-bar systems held
+  for seconds; raise it if the video flips faster, and lower `--change` if
+  two distinct systems are being merged (0.90 separates real cuts, measured
+  0.05-0.56, from held screens, measured 0.96+).
 - `--ssim 0.95` (default) / `--interval 100`: screenshot dedup threshold and
   sampling density (in video frames). 0.95 is calibrated so that two similar
   but distinct systems (SSIM about 0.94) are both captured while re-shows of
