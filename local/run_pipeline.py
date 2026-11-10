@@ -175,11 +175,34 @@ def trim_img(im, min_white=233):     # from repo combine.py (unchanged logic)
     return im.crop(bbox) if bbox else im
 
 
+def trim_photo_band(im, min_rows=6):
+    """Drop a strip of video footage left at the bottom of a --hands crop.
+
+    Some videos fade the score strip into the footage below, so the contour
+    crop keeps a band of drums/stage light under the notation. After
+    thresholding that band turns into black smears between systems. Only
+    trim when the band is several rows tall and the row above it is mostly
+    white (a genuine sheet margin), so a dark score background or a bottom
+    staff line is left untouched."""
+    rgb = np.array(im.convert('RGB')).astype(np.int16)
+    gray = np.array(im.convert('L'))
+    white = (gray >= 235).mean(axis=1)
+    sat = ((rgb.max(axis=2) - rgb.min(axis=2)) > 25).mean(axis=1)
+    photo = (white < 0.5) | (sat > 0.05)
+    y = im.height - 1
+    while y >= 0 and photo[y]:
+        y -= 1
+    if im.height - 1 - y >= min_rows and y >= 0 and white[y] >= 0.5:
+        im = im.crop((0, 0, im.width, y + 1))
+    return im
+
+
 def prep(path):
     """Load a captured frame: trim borders, mask colored overlays (playback
     cursors, highlight marks), convert to gray and scale to page width."""
     im = Image.open(path)              # keep RGB for repo-identical trim logic
     im = trim_img(im)
+    im = trim_photo_band(im)
     rgb = np.array(im.convert('RGB')).astype(np.int16)
     gray = np.array(im.convert('L'))
     gray[(rgb.max(axis=2) - rgb.min(axis=2)) > 25] = 255
